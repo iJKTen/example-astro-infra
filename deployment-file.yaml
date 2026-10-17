@@ -1,5 +1,5 @@
 template-file-path: infra.yaml
 parameters:
   DomainName: example.net
-  RepositoryId: your-org/your-repo
+  GitHubRepository: your-org/your-repo
   HostedZoneId: your-hostedzone-id

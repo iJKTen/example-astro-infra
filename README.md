@@ -6,14 +6,14 @@ CloudFormation template that deploys an Astro static site to AWS with S3 hosting
 
 - **Connection stack** deployed exporting `Example-GitHubConnectionArn` (series post 2)
 - **Certificate stack** deployed in `us-east-1` exporting `Example-CertificateArn` (series post 3)
-- **Git Sync role** with all permissions from series posts 4 through 13
+- **Git Sync role** from series post 4 with the permission additions from posts 7 through 9, plus post 17 for the artifact bucket cleanup Lambda
 
 ## Parameters
 
 | Parameter | Description |
 |---|---|
 | `DomainName` | Fully qualified domain name (e.g. `example.net`) |
-| `RepositoryId` | GitHub repository in `owner/repo` format |
+| `GitHubRepository` | GitHub repository in `owner/repo` format |
 | `HostedZoneId` | Route 53 hosted zone ID for the domain |
 
 ## What Gets Created
@@ -23,8 +23,9 @@ CloudFormation template that deploys an Astro static site to AWS with S3 hosting
 - CloudFront Function for subdirectory index rewriting (`/blog/` to `/blog/index.html`)
 - Custom error response serving Astro's `/404.html` with a 404 status code
 - S3 bucket policy scoped to the specific CloudFront distribution
-- Route 53 A-record alias pointing the domain to CloudFront
+- Route 53 A and AAAA alias records pointing the domain to CloudFront
 - S3 artifact bucket for pipeline intermediates
+- Lambda-backed custom resource that empties the artifact bucket on stack deletion
 - CodePipeline with Source, Build, and Deploy stages
 - CodeBuild build project (Node.js 20, `npm run build`)
 - CodeBuild deploy project with two-tier S3 caching and CloudFront invalidation
@@ -37,7 +38,7 @@ The repo includes two files. `infra.yaml` is the CloudFormation template. `deplo
 
 1. Update the placeholder values in `deployment-file.yaml` with your domain, repository, and hosted zone ID.
 2. Push the repo to GitHub.
-3. Follow the Sync from Git process in series post 15 to create the stack.
+3. Follow the Sync from Git process in series post 16 to create the stack.
 
 ## Architecture
 
