@@ -20,8 +20,11 @@ Resources:
   # ──────────────────────────────────────────────
   S3WebsiteBucket:
     Type: 'AWS::S3::Bucket'
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
+    # Deleted with the stack. The EmptyWebsiteBucketOnDelete custom resource
+    # empties this versioned bucket first so the delete can succeed. Your Git
+    # repo is the source of truth for the site, not this bucket.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
     Properties:
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
@@ -67,11 +70,14 @@ Resources:
               DaysAfterInitiation: 1
 
   # ──────────────────────────────────────────────
-  # Empty Artifact Bucket (Post 17)
+  # Empty S3 Buckets on Delete (Post 16)
   # ──────────────────────────────────────────────
-  EmptyArtifactBucketRole:
+  EmptyBucketRole:
     Type: 'AWS::IAM::Role'
     Properties:
+      # The Git Sync role scopes iam:CreateRole and iam:PassRole to role/site/*,
+      # so every service role this stack creates lives under the /site/ path.
+      Path: /site/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -91,38 +97,51 @@ Resources:
                 Action:
                   - 's3:ListBucket'
                   - 's3:ListBucketVersions'
-                Resource: !GetAtt PipelineArtifactBucket.Arn
+                Resource:
+                  - !GetAtt PipelineArtifactBucket.Arn
+                  - !GetAtt S3WebsiteBucket.Arn
               - Effect: Allow
                 Action:
                   - 's3:DeleteObject'
                   - 's3:DeleteObjectVersion'
-                Resource: !Sub '${PipelineArtifactBucket.Arn}/*'
+                Resource:
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+                  - !Sub '${S3WebsiteBucket.Arn}/*'
               - Effect: Allow
                 Action:
                   - 'logs:CreateLogGroup'
                   - 'logs:CreateLogStream'
                   - 'logs:PutLogEvents'
-                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-EmptyArtifactBucket*'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-EmptyBucket*'
 
-  EmptyArtifactBucketFunction:
+  EmptyBucketFunction:
     Type: 'AWS::Lambda::Function'
     Properties:
-      FunctionName: !Sub '${AWS::StackName}-EmptyArtifactBucket'
+      FunctionName: !Sub '${AWS::StackName}-EmptyBucket'
       Runtime: python3.12
       Handler: index.handler
       Timeout: 300
-      Role: !GetAtt EmptyArtifactBucketRole.Arn
+      Role: !GetAtt EmptyBucketRole.Arn
       Code:
         ZipFile: |
-          import boto3
           import json
+          import time
           import urllib.request
 
-          def send_response(event, context, status, reason=""):
+          import boto3
+          from botocore.exceptions import ClientError
+
+          # Bail out of the delete loop with this much time left so the function
+          # reports FAILED instead of being killed mid-request and hanging the
+          # stack until the custom resource's ServiceTimeout elapses.
+          MIN_REMAINING_MILLIS = 20000
+          SEND_RESPONSE_ATTEMPTS = 3
+
+          def put_response(event, context, status, reason, physical_id):
               body = json.dumps({
                   "Status": status,
                   "Reason": reason or f"See CloudWatch Log Stream: {context.log_stream_name}",
-                  "PhysicalResourceId": context.log_stream_name,
+                  "PhysicalResourceId": physical_id,
                   "StackId": event["StackId"],
                   "RequestId": event["RequestId"],
                   "LogicalResourceId": event["LogicalResourceId"],
@@ -130,38 +149,83 @@ Resources:
               req = urllib.request.Request(
                   event["ResponseURL"],
                   data=body,
-                  headers={"Content-Type": ""},
+                  headers={"Content-Type": "", "Content-Length": str(len(body))},
                   method="PUT",
               )
               urllib.request.urlopen(req)
 
+          def send_response(event, context, status, reason, physical_id):
+              for attempt in range(1, SEND_RESPONSE_ATTEMPTS + 1):
+                  try:
+                      put_response(event, context, status, reason, physical_id)
+                      return
+                  except Exception as e:
+                      print(f"send_response attempt {attempt} failed: {e}")
+                      if attempt == SEND_RESPONSE_ATTEMPTS:
+                          raise
+                      time.sleep(attempt)
+
           def handler(event, context):
+              bucket = (event.get("ResourceProperties") or {}).get("BucketName")
+              # Reusing event.PhysicalResourceId on Update and Delete keeps the id
+              # stable, so CloudFormation never treats a response as a replacement
+              # and sends a destructive Delete to the "old" resource.
+              physical_id = event.get("PhysicalResourceId") or f"empty-bucket-{bucket}"
+
+              if not isinstance(bucket, str) or not bucket:
+                  send_response(event, context, "FAILED", "ResourceProperties.BucketName must be a non-empty string", physical_id)
+                  return
+
               if event["RequestType"] != "Delete":
-                  send_response(event, context, "SUCCESS")
+                  send_response(event, context, "SUCCESS", "", physical_id)
                   return
 
               try:
-                  bucket = event["ResourceProperties"]["BucketName"]
                   s3 = boto3.client("s3")
                   paginator = s3.get_paginator("list_object_versions")
                   for page in paginator.paginate(Bucket=bucket):
+                      if context.get_remaining_time_in_millis() < MIN_REMAINING_MILLIS:
+                          send_response(event, context, "FAILED", "Function timeout approaching before the bucket was fully emptied; retry the stack deletion", physical_id)
+                          return
                       objects = []
                       for v in page.get("Versions", []):
                           objects.append({"Key": v["Key"], "VersionId": v["VersionId"]})
                       for m in page.get("DeleteMarkers", []):
                           objects.append({"Key": m["Key"], "VersionId": m["VersionId"]})
                       if objects:
-                          s3.delete_objects(Bucket=bucket, Delete={"Objects": objects, "Quiet": True})
-                  send_response(event, context, "SUCCESS")
+                          resp = s3.delete_objects(Bucket=bucket, Delete={"Objects": objects, "Quiet": True})
+                          errors = resp.get("Errors", [])
+                          if errors:
+                              first = errors[0]
+                              send_response(event, context, "FAILED", f"DeleteObjects failed for {len(errors)} object(s); first: {first.get('Key')} {first.get('Code')} {first.get('Message')}", physical_id)
+                              return
+                  send_response(event, context, "SUCCESS", "", physical_id)
+              except ClientError as e:
+                  print(f"Error emptying bucket: {e}")
+                  # Delete is idempotent: a missing bucket is already in the goal state.
+                  if e.response.get("Error", {}).get("Code") == "NoSuchBucket":
+                      send_response(event, context, "SUCCESS", "Bucket already deleted", physical_id)
+                      return
+                  send_response(event, context, "FAILED", str(e), physical_id)
               except Exception as e:
                   print(f"Error emptying bucket: {e}")
-                  send_response(event, context, "FAILED", str(e))
+                  send_response(event, context, "FAILED", str(e), physical_id)
 
   EmptyArtifactBucketOnDelete:
     Type: 'Custom::EmptyS3Bucket'
     Properties:
-      ServiceToken: !GetAtt EmptyArtifactBucketFunction.Arn
+      ServiceToken: !GetAtt EmptyBucketFunction.Arn
+      # Slightly above the Lambda's 300s timeout, so a hung invocation fails
+      # fast instead of CloudFormation waiting the default 3600 seconds.
+      ServiceTimeout: 330
       BucketName: !Ref PipelineArtifactBucket
+
+  EmptyWebsiteBucketOnDelete:
+    Type: 'Custom::EmptyS3Bucket'
+    Properties:
+      ServiceToken: !GetAtt EmptyBucketFunction.Arn
+      ServiceTimeout: 330
+      BucketName: !Ref S3WebsiteBucket
 
   # ──────────────────────────────────────────────
   # Artifact Bucket Policy
@@ -259,6 +323,7 @@ Resources:
   CodeBuildServiceRole:
     Type: 'AWS::IAM::Role'
     Properties:
+      Path: /site/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -269,6 +334,7 @@ Resources:
             Condition:
               StringEquals:
                 'aws:SourceAccount': !Sub '${AWS::AccountId}'
+                'aws:SourceArn': !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${AWS::StackName}-Build'
       Policies:
         - PolicyName: CodeBuildAccess
           PolicyDocument:
@@ -316,7 +382,8 @@ Resources:
             build:
               commands:
                 - aws s3 sync . s3://$DEPLOY_BUCKET --delete --cache-control "max-age=31536000,public,immutable" --exclude "*.html"
-                - aws s3 sync . s3://$DEPLOY_BUCKET --delete --cache-control "max-age=0,no-cache,no-store,must-revalidate" --exclude "*" --include "*.html"
+                # HTML: revalidate every request; no-store is omitted so pages stay bfcache-eligible
+                - aws s3 sync . s3://$DEPLOY_BUCKET --delete --cache-control "max-age=0,no-cache,must-revalidate" --exclude "*" --include "*.html"
             post_build:
               commands:
                 - aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_DIST_ID --paths "/*"
@@ -327,6 +394,7 @@ Resources:
   DeployServiceRole:
     Type: 'AWS::IAM::Role'
     Properties:
+      Path: /site/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -337,6 +405,7 @@ Resources:
             Condition:
               StringEquals:
                 'aws:SourceAccount': !Sub '${AWS::AccountId}'
+                'aws:SourceArn': !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${AWS::StackName}-Deploy'
       Policies:
         - PolicyName: DeployAccess
           PolicyDocument:
@@ -375,6 +444,7 @@ Resources:
   CodePipelineServiceRole:
     Type: 'AWS::IAM::Role'
     Properties:
+      Path: /site/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -472,7 +542,8 @@ Resources:
     Type: 'AWS::CloudFront::OriginAccessControl'
     Properties:
       OriginAccessControlConfig:
-        Name: !Sub '${DomainName}-oac'
+        Name: !Sub '${AWS::StackName}-OAC'
+        Description: !Sub 'OAC for ${DomainName}'
         OriginAccessControlOriginType: s3
         SigningBehavior: always
         SigningProtocol: sigv4
@@ -508,7 +579,7 @@ Resources:
             ContentSecurityPolicy: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
 
   # ──────────────────────────────────────────────
-  # Subdirectory Index Function (Post 14)
+  # Subdirectory Index Function (Post 14 + Post 18)
   # ──────────────────────────────────────────────
   SubdirectoryIndexFunction:
     Type: 'AWS::CloudFront::Function'
@@ -516,11 +587,34 @@ Resources:
       AutoPublish: true
       Name: !Sub '${AWS::StackName}-IndexRewrite'
       FunctionConfig:
-        Comment: 'Appends index.html to subdirectory requests'
+        Comment: 'Redirects www to apex, then appends index.html to subdirectory requests'
         Runtime: cloudfront-js-2.0
       FunctionCode: |
         function handler(event) {
             var request = event.request;
+            var host = request.headers.host.value.toLowerCase();
+            if (host.startsWith('www.')) {
+                var qs = '';
+                var keys = Object.keys(request.querystring);
+                for (var i = 0; i < keys.length; i++) {
+                    var key = keys[i];
+                    var entry = request.querystring[key];
+                    if (entry.multiValue) {
+                        for (var j = 0; j < entry.multiValue.length; j++) {
+                            qs += (qs ? '&' : '?') + key + (entry.multiValue[j].value ? '=' + entry.multiValue[j].value : '');
+                        }
+                    } else {
+                        qs += (qs ? '&' : '?') + key + (entry.value ? '=' + entry.value : '');
+                    }
+                }
+                return {
+                    statusCode: 301,
+                    statusDescription: 'Moved Permanently',
+                    headers: {
+                        location: { value: 'https://' + host.slice(4) + request.uri + qs }
+                    }
+                };
+            }
             var uri = request.uri;
             if (uri.endsWith('/')) {
                 request.uri += 'index.html';
@@ -542,6 +636,7 @@ Resources:
         HttpVersion: http2and3
         Aliases:
           - !Ref DomainName
+          - !Sub 'www.${DomainName}'
         Origins:
           - Id: S3Origin
             DomainName: !GetAtt S3WebsiteBucket.RegionalDomainName
@@ -588,3 +683,40 @@ Resources:
       AliasTarget:
         DNSName: !GetAtt CloudFrontDistribution.DomainName
         HostedZoneId: Z2FDTNDATAQYW2
+
+  WwwDomainRecord:
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'www.${DomainName}'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  WwwDomainRecordAAAA:
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'www.${DomainName}'
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+Outputs:
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref CloudFrontDistribution
+
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  WebsiteBucketName:
+    Description: S3 bucket hosting the website assets
+    Value: !Ref S3WebsiteBucket
+
+  SiteUrl:
+    Description: Live site URL
+    Value: !Sub 'https://${DomainName}'
